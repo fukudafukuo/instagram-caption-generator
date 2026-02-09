@@ -16,6 +16,7 @@ import os
 import io
 import re
 import time
+import base64
 from datetime import datetime, timedelta, date as date_type
 from pathlib import Path
 
@@ -25,6 +26,13 @@ import google.generativeai as genai
 # ── 設定 ──────────────────────────────────────────
 CLIENTS_DIR = Path(__file__).parent / "clients"
 CLIENTS_DIR.mkdir(exist_ok=True)
+
+# GitHub API 永続化設定
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "fukudafukuo/instagram-caption-generator")
+GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
+GITHUB_CLIENTS_DIR = "clients"
+USE_GITHUB_STORAGE = bool(GITHUB_TOKEN)
 
 st.set_page_config(
     page_title="Instagram投稿文ジェネレーター",
@@ -78,34 +86,144 @@ def get_suggested_events(post_date):
     return events
 
 
+# ── GitHub API ヘルパー ──────────────────────────────
+def _gh_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+
+def _gh_get_file(filepath):
+    """GitHub上のファイルを取得。(content_dict, error) を返す"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}?ref={GITHUB_BRANCH}"
+    resp = requests.get(url, headers=_gh_headers(), timeout=10)
+    if resp.status_code == 200:
+        return resp.json(), None
+    elif resp.status_code == 404:
+        return None, None
+    else:
+        return None, f"GitHub API error {resp.status_code}"
+
+
+def _gh_put_file(filepath, content_bytes, message, sha=None):
+    """GitHub上にファイルを作成/更新"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}"
+    body = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    resp = requests.put(url, headers=_gh_headers(), json=body, timeout=10)
+    return resp.status_code in (200, 201)
+
+
+def _gh_delete_file(filepath, sha, message):
+    """GitHub上のファイルを削除"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}"
+    body = {
+        "message": message,
+        "sha": sha,
+        "branch": GITHUB_BRANCH,
+    }
+    resp = requests.delete(url, headers=_gh_headers(), json=body, timeout=10)
+    return resp.status_code == 200
+
+
+def _gh_list_dir(dirpath):
+    """GitHub上のディレクトリ内ファイル一覧を取得"""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{dirpath}?ref={GITHUB_BRANCH}"
+    resp = requests.get(url, headers=_gh_headers(), timeout=10)
+    if resp.status_code == 200:
+        return resp.json(), None
+    elif resp.status_code == 404:
+        return [], None
+    else:
+        return [], f"GitHub API error {resp.status_code}"
+
+
 # ── クライアントプロフィール管理 ──────────────────────
 def load_client_list():
-    clients = {}
-    for f in CLIENTS_DIR.glob("*.json"):
-        with open(f, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-            clients[f.stem] = data.get("name", f.stem)
-    return clients
+    if USE_GITHUB_STORAGE:
+        files, err = _gh_list_dir(GITHUB_CLIENTS_DIR)
+        if err:
+            st.warning(f"クライアント一覧取得エラー: {err}")
+            return {}
+        clients = {}
+        for f in files:
+            if f["name"].endswith(".json"):
+                cid = f["name"].replace(".json", "")
+                # ファイル内容を取得して名前を読む
+                file_data, _ = _gh_get_file(f"{GITHUB_CLIENTS_DIR}/{f['name']}")
+                if file_data and "content" in file_data:
+                    try:
+                        raw = base64.b64decode(file_data["content"]).decode("utf-8")
+                        data = json.loads(raw)
+                        clients[cid] = data.get("name", cid)
+                    except Exception:
+                        clients[cid] = cid
+                else:
+                    clients[cid] = cid
+        return clients
+    else:
+        clients = {}
+        for f in CLIENTS_DIR.glob("*.json"):
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                clients[f.stem] = data.get("name", f.stem)
+        return clients
 
 
 def load_client(client_id):
-    path = CLIENTS_DIR / f"{client_id}.json"
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as fp:
-            return json.load(fp)
-    return None
+    if USE_GITHUB_STORAGE:
+        filepath = f"{GITHUB_CLIENTS_DIR}/{client_id}.json"
+        file_data, err = _gh_get_file(filepath)
+        if err:
+            st.warning(f"クライアント読込エラー: {err}")
+            return None
+        if file_data and "content" in file_data:
+            try:
+                raw = base64.b64decode(file_data["content"]).decode("utf-8")
+                return json.loads(raw)
+            except Exception:
+                return None
+        return None
+    else:
+        path = CLIENTS_DIR / f"{client_id}.json"
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as fp:
+                return json.load(fp)
+        return None
 
 
 def save_client(client_id, profile):
-    path = CLIENTS_DIR / f"{client_id}.json"
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(profile, fp, ensure_ascii=False, indent=2)
+    if USE_GITHUB_STORAGE:
+        filepath = f"{GITHUB_CLIENTS_DIR}/{client_id}.json"
+        content = json.dumps(profile, ensure_ascii=False, indent=2).encode("utf-8")
+        # 既存ファイルのSHAを取得（更新時に必要）
+        existing, _ = _gh_get_file(filepath)
+        sha = existing["sha"] if existing else None
+        ok = _gh_put_file(filepath, content, f"Save client: {client_id}", sha)
+        if not ok:
+            st.error("クライアント保存に失敗しました。GitHub Token の権限を確認してください。")
+    else:
+        path = CLIENTS_DIR / f"{client_id}.json"
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(profile, fp, ensure_ascii=False, indent=2)
 
 
 def delete_client(client_id):
-    path = CLIENTS_DIR / f"{client_id}.json"
-    if path.exists():
-        path.unlink()
+    if USE_GITHUB_STORAGE:
+        filepath = f"{GITHUB_CLIENTS_DIR}/{client_id}.json"
+        existing, _ = _gh_get_file(filepath)
+        if existing:
+            _gh_delete_file(filepath, existing["sha"], f"Delete client: {client_id}")
+    else:
+        path = CLIENTS_DIR / f"{client_id}.json"
+        if path.exists():
+            path.unlink()
 
 
 def fetch_brand_concept(url, api_key):
