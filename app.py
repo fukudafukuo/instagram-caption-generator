@@ -236,7 +236,7 @@ def fetch_brand_concept(url, api_key):
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = f"""以下はブランドの公式Webサイトのテキストです。
 このブランドのコンセプト・理念・ストーリー・こだわりを300〜500文字程度で要約してください。
 要約文のみを出力してください。前置きや説明は不要です。
@@ -431,7 +431,7 @@ def generate_caption(entry, product_texts, profile, api_key,
     product_texts: dict of {url: text} 取得済みページテキスト
     """
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     post_type = entry.get("type", "single")
 
